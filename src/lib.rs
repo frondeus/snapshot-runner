@@ -1,17 +1,18 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Context, Error, Result, bail};
 use chrono::{DateTime, Local};
 use diff_utils::{Comparison, DisplayOptions, PatchOptions};
 use regex::Regex;
-use std::io::Write;
+use std::{collections::HashMap, io::Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use serde::de::DeserializeOwned;
 
 fn assert_section(entry: Entry, actual: String) -> Result<()> {
     let mut new_snap_path: PathBuf = entry.entry.into();
     let ext = format!("{}.new", entry.section_name);
     new_snap_path.set_extension(&ext);
 
-    let expected = entry.section;
+    let expected = format!("{}{}", entry.section, entry.last_line);
 
     if expected != actual {
         let expected_lines = expected.lines().collect::<Vec<_>>();
@@ -34,9 +35,9 @@ fn assert_section(entry: Entry, actual: String) -> Result<()> {
             let entry_basename = entry.entry.file_name().unwrap().to_string_lossy();
             let snap_basename = new_snap_path.file_name().unwrap().to_string_lossy();
 
-            writeln!(file, "```")?;
-            writeln!(file, "{}", entry.input)?;
-            writeln!(file, "```")?;
+            // writeln!(file, "```")?;
+            // writeln!(file, "{}", entry.input)?;
+            // writeln!(file, "```")?;
             write!(
                 file,
                 "{}",
@@ -58,18 +59,37 @@ fn assert_section(entry: Entry, actual: String) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum EntryKind {
+    Input,
+    Expected
+}
+
+#[derive(Debug)]
 struct Entry<'a> {
+    kind: EntryKind,
     section_name: &'a str,
     line: usize,
     section: &'a str,
-    input: &'a str,
     entry: &'a Path,
     modified: SystemTime,
+    last_line: &'a str
 }
 
-pub fn test_snapshots(ext: &'static str,
+pub struct SnapshotInputs {
+    inputs: HashMap<String, String>
+}
+
+impl SnapshotInputs {
+    pub fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
+        let input = self.inputs.get(key).with_context(|| format!("Could not find a snapshot section called: {}", key))?;
+        serde_json::from_str(&input).map_err(Error::from)
+    }
+}
+
+pub fn test_snapshots(
                       section_name: &'static str,
-                      f: impl 'static + Fn(&str) -> String + Send) -> Result<()> {
+                      f: impl 'static + Fn(&SnapshotInputs) -> String + Send) -> Result<()> {
 
     const TIMEOUT: u32 = 60_000;
     use pulse::{Signal, TimeoutError};
@@ -78,7 +98,7 @@ pub fn test_snapshots(ext: &'static str,
 
     let guard = std::thread::spawn(move || {
         pulse_start.pulse();
-        let result = test_snapshots_inner(ext, section_name, f);
+        let result = test_snapshots_inner(section_name, f);
         pulse_end.pulse();
         result
     });
@@ -94,53 +114,94 @@ pub fn test_snapshots(ext: &'static str,
     guard.join().unwrap()
 }
 
-fn test_snapshots_inner(ext: &str, section_name: &str, f: impl Fn(&str) -> String) -> Result<()> {
+fn test_snapshots_inner(section_name: &str, f: impl Fn(&SnapshotInputs) -> String) -> Result<()> {
+    struct CurrentSection<'a> {
+        from: usize,
+        from_inner: usize,
+        to: usize,
+        last_line: Option<(usize, usize)>,
+        line: usize,
+        name: &'a str
+    }
+
+    impl<'a> CurrentSection<'a> {
+        fn into_entry(self, source: &'a str, entry: &'a PathBuf) -> Result<Entry<'a>> {
+            let (from, kind) = if self.name.starts_with("expected.") {
+                (self.from, EntryKind::Expected)
+            }
+            else {
+                (self.from_inner, EntryKind::Input)
+            };
+
+            let metadata = std::fs::metadata(&entry)?;
+
+             let last_line = match self.last_line {
+                 Some((from, to)) => &source[from..to],
+                 None => &source[self.to..self.to],
+             };
+
+            Ok(Entry {
+                kind,
+                entry,
+                section_name: self.name,
+                section: &source[from..self.to],
+                line: self.line,
+                last_line,
+                modified: metadata.modified()?
+            })
+        }
+    }
+
     let section_regex = Regex::new(r"^\s*\[([[:alpha:]\.-_]+)\]\s*$")?;
-    let path = go_to_root()?;
+    let path = std::env::current_dir()?;
     let mut successes = 0;
     let mut processed = 0;
     let mut skipped = 0;
-    for entry in glob::glob(&format!("{}/tests/**/*.{}.snap", path.display(), ext))? {
+    for entry in glob::glob(&format!("{}/tests/**/*.snap", path.display()))? {
         let entry = entry?;
-        //dbg!(&entry);
         let entry_file = load_file(&entry)?;
-        let (input, snaps) = get_source(&entry_file)?;
-        let mut section = None;
-        let mut from = 0;
-        let mut to = snaps.len();
-        let mut last_line = None;
-        let input_len = input.lines().count() + 2;
-        for (line_idx, line) in snaps.lines().enumerate() {
+
+        let mut sections: HashMap<String, Entry> = HashMap::default();
+        let mut current_section: Option<CurrentSection> = None;
+        let input_len = entry_file.lines().count();
+        for(line_idx, line) in entry_file.lines().enumerate() {
             if let Some(captures) = section_regex.captures(line) {
-                let offset = offset(snaps, line);
-                if section.is_some() {
-                    to = offset + line.len();
-                    last_line = Some(offset);
-                    break;
+                let offset = offset(&entry_file, line);
+                let len = line.len();
+
+                if let Some(mut current_section) = current_section.take() {
+                    current_section.to = offset;
+                    current_section.last_line = Some((offset, offset + len));
+                    sections.insert(current_section.name.into(), current_section.into_entry(&entry_file, &entry)?);
                 }
                 let name = captures.get(1).unwrap().as_str();
-                if name == section_name {
-                    from = offset;
-                    section = Some(input_len + line_idx);
-                }
+                current_section = Some(CurrentSection {
+                    name,
+                    from: offset,
+                    from_inner: offset + len,
+                    to: offset + len,
+                    last_line: None,
+                    line: input_len + line_idx
+                });
             }
         }
-        if let Some(line) = section {
-            let metadata = std::fs::metadata(&entry)?;
-            let e = Entry {
-                entry: &entry,
-                input,
-                section_name,
-                section: &snaps[from..to],
-                line,
-                modified: metadata.modified()?,
-            };
-            let last_line = match last_line {
-                Some(from) => &snaps[from..to],
-                None => &snaps[to..to],
-            };
-            let actual = format!("[{}]\n{}\n\n{}", section_name, f(input), last_line);
-            match assert_section(e, actual) {
+
+        if let Some(mut current_section) = current_section.take() {
+            current_section.to = entry_file.len();
+            sections.insert(current_section.name.into(), current_section.into_entry(&entry_file, &entry)?);
+        }
+
+        let section_name = format!("expected.{}", section_name);
+        let (inputs, mut expected): (HashMap<_, _>, HashMap<_, _>) = sections.into_iter().partition(|(_name, section)| matches!(section.kind, EntryKind::Input));
+
+        if let Some(section) = expected.remove(&section_name) {
+            let inputs = inputs.into_iter().map(|(k, v)| (k, v.section.into())).collect();
+            let inputs = SnapshotInputs {
+                    inputs
+                };
+            let output = f(&inputs);
+            let actual = format!("[{}]\n{}\n\n{}", section_name, output, section.last_line);
+            match assert_section(section, actual) {
                 Ok(_) => {
                     successes += 1;
                     eprint!(".");
@@ -153,6 +214,7 @@ fn test_snapshots_inner(ext: &str, section_name: &str, f: impl Fn(&str) -> Strin
         } else {
             skipped += 1;
         }
+
     }
     eprintln!(
         "\nProcessed {}: {}, Failed: {}, Skipped: {}",
@@ -173,35 +235,7 @@ fn offset(parent: &str, child: &str) -> usize {
     child_ptr - parent_ptr
 }
 
-fn get_source(file: &str) -> Result<(&str, &str)> {
-    let iter = file.chars();
-    let bt_count = iter.take_while(|c| *c == '`').count();
-    let pat = format!("{:`>width$}", "\n", width = bt_count + 1);
-    let splited = file.split(&pat).collect::<Vec<_>>();
-    if splited.len() != 3 {
-        bail!("Expected one source wrapped in {}: {}", pat, file)
-    }
-    let input = splited[1].trim_end_matches('\n'); //.trim();
-    let sections = splited[2];
-    Ok((input, sections))
-}
-
 fn load_file(entry: &Path) -> Result<String> {
     let s = std::fs::read_to_string(entry)?;
     Ok(s)
-}
-
-fn go_to_root() -> Result<PathBuf> {
-    let mut path = std::env::current_dir()?;
-
-    while !path.join("Cargo.lock").exists() {
-        path = path
-            .parent()
-            .ok_or_else(|| anyhow!("Couldn't find parent directory"))?
-            .into();
-    }
-
-    path = path.canonicalize()?;
-
-    Ok(path)
 }
