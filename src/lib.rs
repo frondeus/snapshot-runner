@@ -1,11 +1,11 @@
-use anyhow::{Context, Error, Result, bail};
+use anyhow::{bail, Context, Error, Result};
 use chrono::{DateTime, Local};
 use diff_utils::{Comparison, DisplayOptions, PatchOptions};
 use regex::Regex;
-use std::{collections::HashMap, io::Write};
+use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use serde::de::DeserializeOwned;
+use std::{collections::HashMap, io::Write};
 
 fn assert_section(entry: Entry, actual: String) -> Result<()> {
     let mut new_snap_path: PathBuf = entry.entry.into();
@@ -62,7 +62,7 @@ fn assert_section(entry: Entry, actual: String) -> Result<()> {
 #[derive(Debug)]
 enum EntryKind {
     Input,
-    Expected
+    Expected,
 }
 
 #[derive(Debug)]
@@ -73,24 +73,27 @@ struct Entry<'a> {
     section: &'a str,
     entry: &'a Path,
     modified: SystemTime,
-    last_line: &'a str
+    last_line: &'a str,
 }
 
 pub struct SnapshotInputs {
-    inputs: HashMap<String, String>
+    inputs: HashMap<String, String>,
 }
 
 impl SnapshotInputs {
     pub fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
-        let input = self.inputs.get(key).with_context(|| format!("Could not find a snapshot section called: {}", key))?;
+        let input = self
+            .inputs
+            .get(key)
+            .with_context(|| format!("Could not find a snapshot section called: {}", key))?;
         serde_json::from_str(&input).map_err(Error::from)
     }
 }
 
-pub fn test_snapshots(
-                      section_name: &'static str,
-                      f: impl 'static + Fn(&SnapshotInputs) -> String + Send) -> Result<()> {
-
+pub fn test_snapshots<F>(section_name: &'static str, f: F) -> Result<()>
+where
+    F: 'static + std::panic::RefUnwindSafe + Fn(&SnapshotInputs) -> String + Send,
+{
     const TIMEOUT: u32 = 60_000;
     use pulse::{Signal, TimeoutError};
     let (signal_start, pulse_start) = Signal::new();
@@ -107,38 +110,40 @@ pub fn test_snapshots(
     match signal_end.wait_timeout_ms(TIMEOUT) {
         Err(TimeoutError::Timeout) => {
             bail!("Timed out");
-        },
-        _ => ()
+        }
+        _ => (),
     }
 
     guard.join().unwrap()
 }
 
-fn test_snapshots_inner(section_name: &str, f: impl Fn(&SnapshotInputs) -> String) -> Result<()> {
+fn test_snapshots_inner<F>(section_name: &str, f: F) -> Result<()>
+where
+    F: std::panic::RefUnwindSafe + Fn(&SnapshotInputs) -> String,
+{
     struct CurrentSection<'a> {
         from: usize,
         from_inner: usize,
         to: usize,
         last_line: Option<(usize, usize)>,
         line: usize,
-        name: &'a str
+        name: &'a str,
     }
 
     impl<'a> CurrentSection<'a> {
         fn into_entry(self, source: &'a str, entry: &'a PathBuf) -> Result<Entry<'a>> {
             let (from, kind) = if self.name.starts_with("expected.") {
                 (self.from, EntryKind::Expected)
-            }
-            else {
+            } else {
                 (self.from_inner, EntryKind::Input)
             };
 
             let metadata = std::fs::metadata(&entry)?;
 
-             let last_line = match self.last_line {
-                 Some((from, to)) => &source[from..to],
-                 None => &source[self.to..self.to],
-             };
+            let last_line = match self.last_line {
+                Some((from, to)) => &source[from..to],
+                None => &source[self.to..self.to],
+            };
 
             Ok(Entry {
                 kind,
@@ -147,7 +152,7 @@ fn test_snapshots_inner(section_name: &str, f: impl Fn(&SnapshotInputs) -> Strin
                 section: &source[from..self.to],
                 line: self.line,
                 last_line,
-                modified: metadata.modified()?
+                modified: metadata.modified()?,
             })
         }
     }
@@ -160,11 +165,10 @@ fn test_snapshots_inner(section_name: &str, f: impl Fn(&SnapshotInputs) -> Strin
     for entry in glob::glob(&format!("{}/tests/**/*.snap", path.display()))? {
         let entry = entry?;
         let entry_file = load_file(&entry)?;
-
         let mut sections: HashMap<String, Entry> = HashMap::default();
         let mut current_section: Option<CurrentSection> = None;
         let input_len = entry_file.lines().count();
-        for(line_idx, line) in entry_file.lines().enumerate() {
+        for (line_idx, line) in entry_file.lines().enumerate() {
             if let Some(captures) = section_regex.captures(line) {
                 let offset = offset(&entry_file, line);
                 let len = line.len();
@@ -172,7 +176,10 @@ fn test_snapshots_inner(section_name: &str, f: impl Fn(&SnapshotInputs) -> Strin
                 if let Some(mut current_section) = current_section.take() {
                     current_section.to = offset;
                     current_section.last_line = Some((offset, offset + len));
-                    sections.insert(current_section.name.into(), current_section.into_entry(&entry_file, &entry)?);
+                    sections.insert(
+                        current_section.name.into(),
+                        current_section.into_entry(&entry_file, &entry)?,
+                    );
                 }
                 let name = captures.get(1).unwrap().as_str();
                 current_section = Some(CurrentSection {
@@ -181,40 +188,53 @@ fn test_snapshots_inner(section_name: &str, f: impl Fn(&SnapshotInputs) -> Strin
                     from_inner: offset + len,
                     to: offset + len,
                     last_line: None,
-                    line: input_len + line_idx
+                    line: input_len + line_idx,
                 });
             }
         }
 
         if let Some(mut current_section) = current_section.take() {
             current_section.to = entry_file.len();
-            sections.insert(current_section.name.into(), current_section.into_entry(&entry_file, &entry)?);
+            sections.insert(
+                current_section.name.into(),
+                current_section.into_entry(&entry_file, &entry)?,
+            );
         }
 
         let section_name = format!("expected.{}", section_name);
-        let (inputs, mut expected): (HashMap<_, _>, HashMap<_, _>) = sections.into_iter().partition(|(_name, section)| matches!(section.kind, EntryKind::Input));
+        let (inputs, mut expected): (HashMap<_, _>, HashMap<_, _>) = sections
+            .into_iter()
+            .partition(|(_name, section)| matches!(section.kind, EntryKind::Input));
 
         if let Some(section) = expected.remove(&section_name) {
-            let inputs = inputs.into_iter().map(|(k, v)| (k, v.section.into())).collect();
-            let inputs = SnapshotInputs {
-                    inputs
-                };
-            let output = f(&inputs);
-            let actual = format!("[{}]\n{}\n\n{}", section_name, output, section.last_line);
-            match assert_section(section, actual) {
-                Ok(_) => {
-                    successes += 1;
-                    eprint!(".");
+            let inputs = inputs
+                .into_iter()
+                .map(|(k, v)| (k, v.section.into()))
+                .collect();
+            let inputs = SnapshotInputs { inputs };
+            let result = std::panic::catch_unwind(|| f(&inputs));
+            match result {
+                Ok(output) => {
+                    let actual = format!("[{}]\n{}\n\n{}", section_name, output, section.last_line);
+                    match assert_section(section, actual) {
+                        Ok(_) => {
+                            successes += 1;
+                            eprint!(".");
+                        }
+                        Err(e) => {
+                            eprintln!("{}: {:?}\n", entry.display(), e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!("{}: {:?}", entry.display(), e);
+
+                Err(_) => {
+                    eprintln!("{}: Thread panicked\n", entry.display());
                 }
             }
             processed += 1;
         } else {
             skipped += 1;
         }
-
     }
     eprintln!(
         "\nProcessed {}: {}, Failed: {}, Skipped: {}",
