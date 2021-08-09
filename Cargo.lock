@@ -67,7 +67,7 @@ dependencies = [
 [[package]]
 name = "diff_utils"
 version = "1.0.0-pre1"
-source = "git+https://github.com/frondeus/diff-assert.git#ec3857677310e49992d5e8ad29445b2e9816ce31"
+source = "git+https://github.com/anixe/diff-assert.git#24238dbd2e7037c1a2665b95070b8267c43b9d1d"
 dependencies = [
  "chrono",
  "colored",
