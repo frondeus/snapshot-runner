@@ -81,6 +81,13 @@ pub struct SnapshotInputs {
 }
 
 impl SnapshotInputs {
+    pub fn get_str(&self, key: &str) -> Result<&str> {
+        let input = self
+            .inputs
+            .get(key)
+            .with_context(|| format!("Could not find a snapshot section called: {}", key))?;
+        Ok(&input)
+    }
     pub fn get_json<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
         let input = self
             .inputs
